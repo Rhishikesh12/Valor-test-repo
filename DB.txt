@@ -1,0 +1,153 @@
+const {
+    S3Client,
+    GetObjectCommand,
+    PutObjectCommand,
+} = require("@aws-sdk/client-s3");
+const mongoose = require('mongoose');
+const VideoModel = require('./videoModel');
+const fs = require("node:fs/promises");
+const fsOld = require("fs");
+const path = require("node:path");
+const ffmpeg = require("fluent-ffmpeg");
+require("dotenv").config();
+
+const RESOLUTIONS = [
+    { name: "720p", width: 1280, height: 720 },
+    { name: "480p", width: 854, height: 480 },
+    { name: "360p", width: 480, height: 360 },
+];
+
+const s3client = new S3Client({
+    region: process.env.AWS_REGION,
+    credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    },
+});
+
+// MongoDB Connection
+mongoose.connect(process.env.MONGODB_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+})
+.then(() => console.log('Connected to MongoDB'))
+.catch((err) => console.error('MongoDB connection error:', err));
+
+// Generate a unique identifier for the video
+const generateUniqueIdentifier = () => {
+    return Date.now().toString(36) + Math.random().toString(36).substr(2);
+};
+
+async function init() {
+    // Required environment variables
+    const BUCKET_NAME = process.env.BUCKET_NAME;
+    const KEY = process.env.KEY;
+    const PROD_BUCKET = process.env.PROD_BUCKET;
+
+    // Critical validation
+    if (!BUCKET_NAME || !KEY || !PROD_BUCKET) {
+        console.error("Please provide BUCKET_NAME, KEY, and PROD_BUCKET in the .env file");
+        process.exit(1);
+    }
+
+    try {
+        // Download the original video
+        const command = new GetObjectCommand({
+            Bucket: BUCKET_NAME,
+            Key: KEY,
+        });
+        const result = await s3client.send(command);
+        const originalFilePath = "originalVideo.mp4";
+        await fs.writeFile(originalFilePath, result.Body);
+        const originalVideoPath = path.resolve(originalFilePath);
+
+        // Prepare video links object
+        const videoQualityLinks = {};
+
+        // Transcode the video
+        const transcodePromises = RESOLUTIONS.map((resolution) => {
+            const output = `video-${resolution.name}.mp4`;
+            
+            return new Promise((resolve, reject) => {
+                ffmpeg(originalVideoPath)
+                    .output(output)
+                    .withVideoCodec("libx264")
+                    .withAudioCodec("aac")
+                    .withSize(`${resolution.width}x${resolution.height}`)
+                    .on("end", async () => {
+                        const s3Key = `transcoded/${output}`;
+                        
+                        const putCommand = new PutObjectCommand({
+                            Bucket: PROD_BUCKET,
+                            Key: s3Key,
+                            Body: fsOld.createReadStream(path.resolve(output)),
+                        });
+                        
+                        try {
+                            await s3client.send(putCommand);
+                            
+                            // Generate S3 URL
+                            const s3Url = `https://${PROD_BUCKET}.s3.amazonaws.com/${s3Key}`;
+                            
+                            // Store video link by resolution
+                            videoQualityLinks[resolution.name] = s3Url;
+                            
+                            resolve();
+                        } catch (uploadError) {
+                            console.error(`Upload failed for ${output}:`, uploadError);
+                            reject(uploadError);
+                        }
+                    })
+                    .on("error", (err) => {
+                        console.error(`Transcoding error for ${resolution.name}:`, err);
+                        reject(err);
+                    })
+                    .format("mp4")
+                    .run();
+            });
+        });
+
+        // Wait for all transcodes to complete
+        await Promise.all(transcodePromises);
+
+        // Prepare original video S3 URL
+        const originalVideoUrl = `https://${BUCKET_NAME}.s3.amazonaws.com/${KEY}`;
+
+        // Create MongoDB document (Note: You'll need to pass other details like title, description etc. from your actual workflow)
+        const videoDocument = new VideoModel({
+            videos: {
+                video_title: "Sample Video", // Replace with actual title
+                video_desc: "Video description", // Replace with actual description
+                uploaded_video: originalVideoUrl,
+                video_quality: videoQualityLinks,
+                likes: 0,
+                views: 0,
+                thumbnail: null // This will be updated when user uploads thumbnail
+            }
+        });
+
+        // Save to MongoDB
+        await videoDocument.save();
+        console.log("Video document saved to MongoDB");
+
+    } catch (error) {
+        console.error("Error in processing:", error);
+    } finally {
+        // Clean up local files
+        try {
+            await fs.unlink("originalVideo.mp4");
+            await Promise.all(
+                RESOLUTIONS.map(resolution => 
+                    fs.unlink(`video-${resolution.name}.mp4`)
+                )
+            );
+        } catch (cleanupError) {
+            console.warn("Could not delete local video files:", cleanupError);
+        }
+    }
+}
+
+init().finally(() => {
+    // Close MongoDB connection
+    mongoose.connection.close();
+});
